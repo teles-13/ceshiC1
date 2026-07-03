@@ -400,8 +400,12 @@ if __name__ == "__main__":
     mask1d[center_start : center_start + acs_lines] = 1
     mask = mask1d.unsqueeze(0).expand(N1, -1)
 
-    k_hat = kspace_slice * mask.unsqueeze(0) 
-
+    k_hat = kspace_slice * mask.unsqueeze(0)
+    
+    img_zf_temp = ifft2c(k_hat)
+    scale_factor = torch.max(torch.abs(img_zf_temp))
+    kspace_slice = kspace_slice / scale_factor
+    k_hat = k_hat / scale_factor
     # ===============================
     # 计算 G_tensor
     # ===============================
@@ -420,7 +424,7 @@ if __name__ == "__main__":
     # ===============================
     print("Starting Alternating Optimization...")
     # 传入 acs_lines，供汉明窗初始化使用
-    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.05, beta_reg=0.05)
+    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.05, beta_reg=0.5)
     
     u_recon, c_recon = solver.solve(
         max_outer_iter=10, 
