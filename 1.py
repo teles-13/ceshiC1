@@ -127,12 +127,12 @@ def G_matrices(kCal, N1, N2, tau, U, kernel_shape):
     
     phaseKernel = torch.exp(-1j * 2 * torch.pi * (n1 * (N1_g - 2*tau - 1) + n2 * (N2_g - 2*tau - 1)))
     # [修改] 增加 norm='ortho' 保持能量守恒，匹配图像域算子的量级
-    G = torch.fft.ifft2(G, s=(N1_g, N2_g), dim=(0,1), norm='ortho') * phaseKernel.unsqueeze(2).unsqueeze(3)
+    G = torch.fft.ifft2(G, s=(N1_g, N2_g), dim=(0,1), norm='forward') * phaseKernel.unsqueeze(2).unsqueeze(3)
     G = torch.fft.fftshift(G, dim=(0,1))
     
     return G
     
-    return G
+    
 
 def compute_G_for_fastmri_slice(kspace_slice, cal_length=32, tau=3, threshold=0.08, kernel_shape=1):
     kData = kspace_slice.permute(1, 2, 0)
@@ -234,12 +234,16 @@ def save_intermediate_results(u_tensor, c_tensor, iter_num, save_dir=".", crop_s
     plt.savefig(os.path.join(cq_dir, f"cq_iter_{iter_num:02d}.png"), bbox_inches='tight', dpi=150)
     plt.close()
 
-# ==========================================
-# 4. 共轭梯度法求解器
-# ==========================================
-def cg_solve(A_func, b, max_iter=10, tol=1e-6):
-    x = torch.zeros_like(b)
-    r = b.clone()
+def cg_solve(A_func, b, x0=None, max_iter=10, tol=1e-6):
+    # 【修复】支持传入初始猜测值 x0 (Warm Start)
+    if x0 is None:
+        x = torch.zeros_like(b)
+        r = b.clone()
+    else:
+        x = x0.clone()
+        # 计算初始残差: r = b - A(x0)
+        r = b - A_func(x)
+        
     p = r.clone()
     rsold = torch.sum(torch.real(r.conj() * r))
     
@@ -323,6 +327,9 @@ class SenseJacobianSolver:
         # 计算初始敏感度图，加入小常数防止除 0
         c_k = img_low_freq / (u_low_freq + 1e-8)
 
+
+        mask_threshold = 0.05 * torch.max(u_low_freq)
+        spatial_mask = (u_low_freq > mask_threshold).to(self.k_hat.dtype)
         # 2. 计算正常零填充图像，用于自适应线圈合并初始化 u_k
         img_zf = ifft2c(self.k_hat)
         
@@ -364,7 +371,7 @@ class SenseJacobianSolver:
             for q in range(self.Nc):
                 b_u += c_k[q].conj() * ifft2c(self.k_hat[q])
 
-            u_k = cg_solve(A_u, b_u, max_iter=cg_iter_u)
+            u_k = cg_solve(A_u, b_u, x0=u_old, max_iter=cg_iter_u)
             print("  Image u updated.")
 
             # 第二步: 更新 c_p
@@ -387,14 +394,17 @@ class SenseJacobianSolver:
                         v_p_prior += self.G_tensor[:, :, p, q] * c_k[q]
                 
                 v_p = v_p_data - self.beta_reg * v_p_prior
-                c_new[p] = cg_solve(A_c, v_p, max_iter=cg_iter_c)
+                c_new[p] = cg_solve(A_c, v_p, x0=c_k[p], max_iter=cg_iter_c)
                 
             c_filtered = self._apply_low_pass(c_new)
-            c_k = c_filtered
-            print("  Coil sensitivities c_q updated.")
+            
+            # [修改] 直接乘上初始化时生成的实心掩膜，切掉背景且保留大脑内部
+            c_k = c_filtered * spatial_mask.unsqueeze(0)
+            print("  Coil sensitivities c_q updated and masked.")
             
             # 保存本次外层迭代的图像结果
             save_intermediate_results(u_k, c_k, k+1, save_dir)
+            
             
             # 收敛性判断
             diff = torch.norm(u_k - u_old) / (torch.norm(u_old) + 1e-8)
@@ -409,7 +419,7 @@ class SenseJacobianSolver:
 # 6. 主程序运行逻辑
 # ==========================================
 if __name__ == "__main__":
-    device = torch.device('cuda:3' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
     # 数据路径
@@ -451,6 +461,9 @@ if __name__ == "__main__":
     # ===============================
     print("Computing G_tensor via ESPIRiT null-space calibration...")
     G_tensor = compute_G_for_fastmri_slice(k_hat, cal_length=acs_lines, tau=3, threshold=0.08, kernel_shape=1)
+
+    G_tensor = G_tensor / (torch.max(torch.abs(G_tensor)) + 1e-12)
+
     print(f"G_tensor shape: {G_tensor.shape}")
 
     # ===============================
@@ -464,11 +477,11 @@ if __name__ == "__main__":
     # ===============================
     print("Starting Alternating Optimization...")
     # 传入 acs_lines，供汉明窗初始化使用
-    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.01, beta_reg=0.01)
+    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.05, beta_reg=0.001)
     
     u_recon, c_recon = solver.solve(
-        max_outer_iter=20, 
-        cg_iter_u=5, 
+        max_outer_iter=10, 
+        cg_iter_u=20, 
         cg_iter_c=10, 
         save_dir=save_directory
     )
