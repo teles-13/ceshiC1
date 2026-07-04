@@ -188,7 +188,14 @@ def center_crop(data, shape):
 # 3. 可视化保存函数 (已更新：裁剪 + 纯灰度)
 # ==========================================
 def save_intermediate_results(u_tensor, c_tensor, iter_num, save_dir=".", crop_size=(320, 320)):
-    """保存每次迭代的 u 和 c_q，自动裁剪并使用灰度图"""
+    """保存每次迭代的 u 和 c_q，自动裁剪并使用灰度图，分别存入不同子文件夹"""
+    
+    # [新增] 自动创建两个子文件夹
+    u_dir = os.path.join(save_dir, "recon_u")
+    cq_dir = os.path.join(save_dir, "coil_sensitivities")
+    os.makedirs(u_dir, exist_ok=True)   # exist_ok=True 表示如果文件夹已存在则不报错
+    os.makedirs(cq_dir, exist_ok=True)
+
     # 裁剪并转为幅值 numpy
     u_mag = torch.abs(center_crop(u_tensor, crop_size)).detach().cpu().numpy()
     c_mag = torch.abs(center_crop(c_tensor, crop_size)).detach().cpu().numpy()
@@ -201,7 +208,8 @@ def save_intermediate_results(u_tensor, c_tensor, iter_num, save_dir=".", crop_s
     plt.imshow(u_mag, cmap='gray', vmin=0, vmax=u_vmax)
     plt.title(f"Reconstructed Image u - Iteration {iter_num}")
     plt.axis('off')
-    plt.savefig(os.path.join(save_dir, f"u_iter_{iter_num:02d}.png"), bbox_inches='tight', dpi=150)
+    # [修改] 存入 u_dir
+    plt.savefig(os.path.join(u_dir, f"u_iter_{iter_num:02d}.png"), bbox_inches='tight', dpi=150)
     plt.close()
 
     # 2. 保存敏感度图 c_q (网格排布, 灰度图)
@@ -222,7 +230,8 @@ def save_intermediate_results(u_tensor, c_tensor, iter_num, save_dir=".", crop_s
         
     plt.suptitle(f"Coil Sensitivities - Iteration {iter_num}", fontsize=14)
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"cq_iter_{iter_num:02d}.png"), bbox_inches='tight', dpi=150)
+    # [修改] 存入 cq_dir
+    plt.savefig(os.path.join(cq_dir, f"cq_iter_{iter_num:02d}.png"), bbox_inches='tight', dpi=150)
     plt.close()
 
 # ==========================================
@@ -291,32 +300,36 @@ class SenseJacobianSolver:
 
     def solve(self, max_outer_iter=10, cg_iter_u=10, cg_iter_c=10, tol=1e-4, save_dir="."):
         # ========================================
-        # [核心更新] 采用 2D 汉明窗的高阶初始化
+        # [核心优化] 规范化的 2D 汉明窗自适应联合初始化
         # ========================================
         device = self.k_hat.device
-        
-        # 1. 正常零填充图像用于 u 的初始化 (包含欠采样混叠伪影)
-        img_zf = ifft2c(self.k_hat)
-        u_k = torch.sqrt(torch.sum(torch.abs(img_zf)**2, dim=0)).to(self.k_hat.dtype)
-        
-        # 2. 汉明窗低频滤波用于敏感度 c_q 的初始化
-        k_low_freq = torch.zeros_like(self.k_hat)
         cx, cy = self.N1 // 2, self.N2 // 2
         hx, hy = self.acs_lines // 2, self.acs_lines // 2
+        
+        # 1. 提取 k 空间低频中心区域，并施加 2D 汉明窗用于线圈敏感度 c_k 的初始化
+        k_low_freq = torch.zeros_like(self.k_hat)
         
         window_x = torch.hamming_window(2 * hx, periodic=False, device=device)
         window_y = torch.hamming_window(2 * hy, periodic=False, device=device)
         window_2d = window_x.unsqueeze(1) * window_y.unsqueeze(0)
         
-        # 截取中心数据并乘以汉明窗
+        # 严格从欠采样数据 self.k_hat 中提取中心低频，保证算法的封装性与独立性
         center_data = self.k_hat[:, cx-hx:cx+hx, cy-hy:cy+hy]
         k_low_freq[:, cx-hx:cx+hx, cy-hy:cy+hy] = center_data * window_2d.unsqueeze(0)
         
         img_low_freq = ifft2c(k_low_freq)
         u_low_freq = torch.sqrt(torch.sum(torch.abs(img_low_freq)**2, dim=0))
         
-        # 除法初始化敏感度，加入小常数防止除 0
+        # 计算初始敏感度图，加入小常数防止除 0
         c_k = img_low_freq / (u_low_freq + 1e-8)
+
+        # 2. 计算正常零填充图像，用于自适应线圈合并初始化 u_k
+        img_zf = ifft2c(self.k_hat)
+        
+        # 【核心改进】利用刚生成的 c_k 对零填充图像进行相位对齐合并，得到更清晰的初始真实图像 u_0
+        numerator = torch.sum(c_k.conj() * img_zf, dim=0)
+        denominator = torch.sum(torch.abs(c_k)**2, dim=0) + 1e-8
+        u_k = (numerator / denominator).to(self.k_hat.dtype)
 
         # 保存初始状态 (Iteration 0)
         save_intermediate_results(u_k, c_k, 0, save_dir)
@@ -451,11 +464,11 @@ if __name__ == "__main__":
     # ===============================
     print("Starting Alternating Optimization...")
     # 传入 acs_lines，供汉明窗初始化使用
-    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.3, beta_reg=0.3)
+    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.01, beta_reg=0.01)
     
     u_recon, c_recon = solver.solve(
-        max_outer_iter=10, 
-        cg_iter_u=10, 
+        max_outer_iter=20, 
+        cg_iter_u=5, 
         cg_iter_c=10, 
         save_dir=save_directory
     )
