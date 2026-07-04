@@ -126,8 +126,11 @@ def G_matrices(kCal, N1, N2, tau, U, kernel_shape):
     n2, n1 = torch.meshgrid(n2, n1, indexing='xy')
     
     phaseKernel = torch.exp(-1j * 2 * torch.pi * (n1 * (N1_g - 2*tau - 1) + n2 * (N2_g - 2*tau - 1)))
-    G = torch.fft.ifft2(G, s=(N1_g, N2_g), dim=(0,1)) * phaseKernel.unsqueeze(2).unsqueeze(3)
+    # [修改] 增加 norm='ortho' 保持能量守恒，匹配图像域算子的量级
+    G = torch.fft.ifft2(G, s=(N1_g, N2_g), dim=(0,1), norm='ortho') * phaseKernel.unsqueeze(2).unsqueeze(3)
     G = torch.fft.fftshift(G, dim=(0,1))
+    
+    return G
     
     return G
 
@@ -263,6 +266,29 @@ class SenseJacobianSolver:
         self.beta_reg = beta_reg
         self.eps = eps
 
+    def _apply_low_pass(self, c_tensor):
+        """对敏感度图进行二维汉明窗低通滤波"""
+        device = c_tensor.device
+        Nc, N1, N2 = c_tensor.shape
+        
+        # 1. 将敏感度图转换到 k 空间
+        k_c = fft2c(c_tensor)
+        
+        # 2. 构建二维汉明窗掩膜
+        cx, cy = N1 // 2, N2 // 2
+        hx, hy = self.acs_lines // 2, self.acs_lines // 2
+        
+        window_x = torch.hamming_window(2 * hx, periodic=False, device=device)
+        window_y = torch.hamming_window(2 * hy, periodic=False, device=device)
+        window_2d = window_x.unsqueeze(1) * window_y.unsqueeze(0)
+        
+        # 3. 创建全尺寸的低频 k 空间张量，并把加窗后的中心低频部分填入
+        k_low_freq = torch.zeros_like(k_c)
+        k_low_freq[:, cx-hx:cx+hx, cy-hy:cy+hy] = k_c[:, cx-hx:cx+hx, cy-hy:cy+hy] * window_2d.unsqueeze(0)
+        
+        # 4. 逆傅里叶变换切回图像域
+        return ifft2c(k_low_freq)
+
     def solve(self, max_outer_iter=10, cg_iter_u=10, cg_iter_c=10, tol=1e-4, save_dir="."):
         # ========================================
         # [核心更新] 采用 2D 汉明窗的高阶初始化
@@ -350,7 +376,8 @@ class SenseJacobianSolver:
                 v_p = v_p_data - self.beta_reg * v_p_prior
                 c_new[p] = cg_solve(A_c, v_p, max_iter=cg_iter_c)
                 
-            c_k = c_new
+            c_filtered = self._apply_low_pass(c_new)
+            c_k = c_filtered
             print("  Coil sensitivities c_q updated.")
             
             # 保存本次外层迭代的图像结果
@@ -380,7 +407,7 @@ if __name__ == "__main__":
         with h5py.File(h5_path, 'r') as f:
             kspace_data = f['kspace'][()] 
             
-        slice_idx = kspace_data.shape[0] // 2
+        slice_idx = 7
         kspace_slice = torch.tensor(kspace_data[slice_idx], dtype=torch.complex64).to(device)
     except Exception as e:
         print(f"Data loading failed: {e}. Exiting.")
@@ -424,7 +451,7 @@ if __name__ == "__main__":
     # ===============================
     print("Starting Alternating Optimization...")
     # 传入 acs_lines，供汉明窗初始化使用
-    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.05, beta_reg=0.5)
+    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.3, beta_reg=0.3)
     
     u_recon, c_recon = solver.solve(
         max_outer_iter=10, 
