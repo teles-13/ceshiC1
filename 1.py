@@ -477,11 +477,11 @@ if __name__ == "__main__":
     # ===============================
     print("Starting Alternating Optimization...")
     # 传入 acs_lines，供汉明窗初始化使用
-    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.05, beta_reg=0.001)
+    solver = SenseJacobianSolver(k_hat, mask, G_tensor, acs_lines=acs_lines, lambda_reg=0.001, beta_reg=0.001)
     
     u_recon, c_recon = solver.solve(
-        max_outer_iter=10, 
-        cg_iter_u=20, 
+        max_outer_iter=20, 
+        cg_iter_u=10, 
         cg_iter_c=10, 
         save_dir=save_directory
     )
